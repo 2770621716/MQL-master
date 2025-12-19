@@ -1,0 +1,142 @@
+【LoRA + RQ 设计改进方案汇总】
+
+一、当前结构回顾
+1. 向量量化
+   - 单层 VQ：每个样本选一个最近的 code（argmin L2 距离）。
+   - 多层 RQ：多层按 residual 方式串联，后层只看前层没解释掉的残差。
+   - 量化损失：codebook_loss + beta * commitment_loss（标准 VQ-VAE 形式）。
+
+2. LoRA 结构
+   - codebook = base_codebook + A @ B
+   - A：多层/多模态共享的低秩子空间（跨模态共享语义）。
+   - B：各层各模态各自独立（模态特异性）。
+
+3. 当前改动
+   - InfoNCE 对齐损失已关闭（align_weight=0）。
+   - 添加 LoRA 正则：
+     - L2 正则：||A||² + ||B||²
+     - 正交约束：||Aᵀ A − I||²
+   - 分层正则化：Layer 0 使用更大的正则化权重（lora_layer0_multiplier）。
+
+----------------------------------------------------------------------
+二、方案 1：一层选多个 code / soft assignment（multi-code VQ）
+
+1. 想法
+   - 现在每层只选一个 code（top-1），信息瓶颈较硬。
+   - 方案：每层允许选多个 code（top-k）或 soft assignment，让同一层表达更丰富的信息。
+
+2. 可能的形式
+   2.1 多 code 加和
+       - 对每个样本、每层，选 top-k 个中心：
+         indices_k = topk(-d, k)  # k 个最近的 code
+       - 聚合方式：
+         - 均匀加和：x_q = (1/k) * Σ_j e_{idx_j}
+         - 加权加和：x_q = Σ_j w_j * e_{idx_j}，w_j 来自 softmax/归一化相似度。
+
+   2.2 soft assignment
+       - 使用 softmax 或 Sinkhorn 得到对所有 code 的权重 q_i：
+         - Q = softmax(-d / T)  或  Q = Sinkhorn(...)
+         - x_q = Σ_i Q_i * e_i
+       - argmax 只用于分析，不用于前向构造 x_q。
+
+3. 对量化损失的影响
+   - VectorQuantizer 内部：
+     - 仍然可以用：
+       commitment_loss = mse(x_q.detach(), x)
+       codebook_loss   = mse(x_q, x.detach())
+       loss = codebook_loss + beta * commitment_loss
+     - 只是 x_q 不再是单一 code，而是多 code 的组合。
+   - ResidualVectorQuantizer / RQ-VAE / MMRQVAE：
+     - 接口不需要改，仍然接收一个标量 quant_loss。
+
+4. KMeans 初始化的影响
+   - 初始化仍然可以使用标准 KMeans（每个样本归到一个中心）。
+   - 为更适配 soft assignment，可考虑：
+     - soft k-means / GMM 初始化（soft cluster 代替硬分配）。
+     - 但非必需，可作为后续优化。
+
+----------------------------------------------------------------------
+三、方案 2：改码本结构（分块 / Product Quantization / 层级 coarse-to-fine）
+
+1. 分块 / Product Quantization（PQ）
+   - 将 embedding 维度拆成 G 个子空间，每个子空间一个独立的 codebook：
+     - x = [x^(1), x^(2), ..., x^(G)]
+     - 每个 x^(g) 由一个 VQ 量化：x_q^(g) = VQ_g(x^(g))
+   - 最终量化：
+     - x_q = concat_g x_q^(g)  或  sum_g x_q^(g)（视设计而定）。
+
+2. PQ 下的量化损失
+   - 每个子空间有自己的：
+     - loss_g = codebook_loss_g + beta * commitment_loss_g
+   - 总量化损失：
+     - loss_quant = Σ_g loss_g  或  (1/G) * Σ_g loss_g
+   - RQ-VAE / MMRQVAE 仍然看到一个标量 quant_loss。
+
+3. PQ 的 KMeans 初始化
+   - 必须按子空间分别跑 KMeans：
+     - 对子空间 g，在所有 x^(g) 上跑 KMeans，得到该子 codebook 的中心。
+   - 不能直接在整条向量 x 上跑一次 KMeans 再切分。
+
+4. 层级 coarse-to-fine codebook
+   - 上层（coarse codebook）：KMeans 初始化在原始 x 上，中心代表“大团”。
+   - 下层（fine codebook）：
+     - 选项 A：在每个 coarse cluster 里单独跑局部 KMeans。
+     - 选项 B：对 residual = x − x_coarse 跑 KMeans。
+   - 量化损失：
+     - loss_quant = w_coarse * loss_coarse + w_fine * loss_fine
+
+----------------------------------------------------------------------
+四、LoRA 正则化与码本使用率的关系（反思）
+
+1. 码本选择机制
+   - d_i = ||x − codebook_i||²
+   - indices = argmin_i d_i
+   - codebook_i = base_codebook_i + (A @ B)_i
+
+2. 正则化（||A||² + ||B||² + ||AᵀA − I||²）的直接作用
+   - 控制 LoRA 偏置的幅度和方向，使 A/B 不至于爆炸或塌缩。
+   - 防止少数 code 被过度偏移、垄断选择。
+
+3. 但不能保证：
+   - 如果某些 codebook_i 一开始就离数据很远，仅靠正则化不一定让它们被选中。
+   - 选择是基于相对距离，正则化只是限制移动幅度，不必然改变 argmin 结构。
+
+4. 更直接改善码本利用率的方法
+   - 码本使用熵 / 多样性损失（Codebook Diversity Loss）：
+     - 统计使用频率 p_i，最大化熵 H(p) = −Σ p_i log p_i，或惩罚方差 Σ(p_i − 1/K)²。
+   - 未使用码本重置：
+     - 定期将从未使用的 code 重置到数据空间中新的位置（例如在最近数据子集上重新 KMeans）。
+   - 温度退火（在 VQ 的 soft assignment 中）：
+     - 早期训练用高温 T，让选择更随机；
+     - 后期慢慢降低 T，使选择更精确。
+
+----------------------------------------------------------------------
+五、层间信息利用的视角
+
+1. 当前 RQ 的层间关系
+   - residual 机制：前一层解释掉一部分信息，后层只看剩余残差。
+   - 实际上前层的信息已经通过“减掉的部分”在约束后层。
+
+2. 更显式的“前层指导后层”的可能设计
+   - 将前层的 indices / embedding 拼接到后层输入：
+     - 输入 = [residual, one_hot(prev_indices)] 或 [residual, embedding(prev_indices)]
+   - 层级 A/B 继承：
+     - A_l = A_{l-1} + ΔA_l，B_l = B_{l-1} + ΔB_l。
+
+----------------------------------------------------------------------
+六、建议的后续实验方向
+
+1. 先做对比实验验证现有改动：
+   - lora_layer0_multiplier = 1.0（基线） vs 2.0（当前）：
+     - 重新训练，跑 check_codebook_usage.py 看 Layer 0 使用率和 margin。
+
+2. 如果正则化对利用率提升有限：
+   - 优先尝试：
+     - 方案1：multi-code / soft assignment（先在 Layer 0 做实验）。
+     - 或 方案2：简单的 2-way PQ（例如把 32 维拆成两个 16 维子空间）。
+
+3. 更进一步：
+   - 引入码本多样性损失（基于使用频率的熵或方差）；
+   - 结合温度退火/Soft VQ，在训练早期防止“早期锁定少数码本”。
+
+
