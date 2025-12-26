@@ -172,12 +172,13 @@ class MMRQVAE(nn.Module):
         loss_quant = text_rq_loss + image_rq_loss
 
         # 对齐损失（双向 InfoNCE）- 可通过 align_weight=0 关闭
+        """
         if self.align_weight > 0:
             align_loss = self.infonce(z_q_text, z_q_image) + self.infonce(z_q_image, z_q_text)
         else:
             # 返回零 tensor 以保持类型一致性
             align_loss = torch.tensor(0.0, device=text_out.device, dtype=text_out.dtype)
-
+        """
         # LoRA 正则化损失
         lora_reg_loss = 0.0
         lora_ortho_loss = 0.0
@@ -210,7 +211,6 @@ class MMRQVAE(nn.Module):
         # 总损失
         loss_total = (loss_recon + 
                      self.quant_loss_weight * loss_quant + 
-                     self.align_weight * align_loss +
                      self.lora_reg_weight * lora_reg_loss +
                      self.lora_ortho_weight * lora_ortho_loss)
 
