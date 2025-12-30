@@ -54,9 +54,15 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=float, default=1.0, help="LoRA scaling factor (fixed to 1.0, use regularization instead)")
     parser.add_argument("--lora_reg_weight", type=float, default=1e-4, help="LoRA L2 regularization weight for A and B")
     parser.add_argument("--lora_ortho_weight", type=float, default=1e-5, help="LoRA orthogonal constraint weight for A")
+    parser.add_argument("--lora_layers", type=str, default="0,1", help="Which layers to use LoRA (comma-separated indices, e.g., '0,1' for first two layers, default: '0,1')")
+    parser.add_argument("--use_recursive_lora", type=bool, default=False, help="Use Recursive LoRA: B evolves across layers (B_i = B_{i-1} + Evolve(B_{i-1}))")
     
     # Alignment parameters
     parser.add_argument("--align_weight", type=float, default=0.0, help="InfoNCE alignment weight (set to 0 to disable)")
+    
+    # Alignment check parameters
+    parser.add_argument("--check_alignment", type=bool, default=True, help="Enable alignment gain check during training")
+    parser.add_argument("--alignment_check_step", type=int, default=10, help="Check alignment every N epochs")
 
     parser.add_argument("--ckpt_dir", type=str, default="", help="output directory for model")
 
@@ -89,6 +95,16 @@ if __name__ == '__main__':
     img_data_path = os.path.join(args.data_root, dataset_name, f'{dataset_name}{args.image_embedding_file}')
     paired_data = DualEmbDataset(text_data_path, img_data_path)
     
+    # 解析lora_layers参数（字符串转列表，如"0,1" -> [0, 1]）
+    if args.lora_layers:
+        try:
+            lora_layers = [int(x.strip()) for x in args.lora_layers.split(',')]
+        except ValueError:
+            print(f"Warning: Invalid lora_layers format '{args.lora_layers}', using default [0, 1]")
+            lora_layers = [0, 1]
+    else:
+        lora_layers = [0, 1]  # 默认前两层
+    
     # 创建多模态模型（一个模型包含两个 RQ）
     model = MMRQVAE(
         text_dim=paired_data.text_dim,
@@ -107,15 +123,21 @@ if __name__ == '__main__':
         use_lora=args.use_lora,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
+        lora_layers=lora_layers,
         align_weight=args.align_weight,
         lora_reg_weight=args.lora_reg_weight,
-        lora_ortho_weight=args.lora_ortho_weight
+        lora_ortho_weight=args.lora_ortho_weight,
+        use_recursive_lora=args.use_recursive_lora
     )
+    model_name = "MMRQVAE"
     
-    print(f"Model created: MMRQVAE")
+    print(f"Model created: {model_name}")
     print(f"  - Text RQ: {len(args.num_emb_list)} layers")
     print(f"  - Image RQ: {len(args.num_emb_list)} layers")
     print(f"  - LoRA: {args.use_lora}, rank={args.lora_rank}, alpha={args.lora_alpha} (fixed, use reg instead)")
+    if args.use_lora:
+        print(f"  - LoRA layers: {args.lora_layers} -> {lora_layers}")
+        print(f"  - Recursive LoRA: {args.use_recursive_lora}")
     print(f"  - LoRA reg weight: {args.lora_reg_weight}, ortho weight: {args.lora_ortho_weight}")
     print(f"  - Align weight: {args.align_weight}")
     
