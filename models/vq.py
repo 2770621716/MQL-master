@@ -35,7 +35,8 @@ class VectorQuantizer(nn.Module):
         
         if self.use_lora:
             self.lora_A = None  
-            self.lora_B = nn.Parameter(torch.zeros(lora_rank, e_dim))  
+            self.lora_B = nn.Parameter(torch.zeros(lora_rank, e_dim))
+            self.dynamic_lora_B = None  # 用于 Recursive LoRA：动态传入的 B  
 
         if use_linear == 1:
             self.codebook_projection = torch.nn.Linear(self.e_dim, self.e_dim)
@@ -45,6 +46,19 @@ class VectorQuantizer(nn.Module):
         """Set the shared LoRA A matrix"""
         self.lora_A = lora_A
     
+    def set_lora_B(self, lora_B):
+        """Set the dynamic LoRA B matrix (for Recursive LoRA)"""
+        self.dynamic_lora_B = lora_B
+    
+    def get_lora_B(self):
+        """Get the current LoRA B matrix (dynamic B takes priority)"""
+        if self.dynamic_lora_B is not None:
+            return self.dynamic_lora_B
+        elif hasattr(self, 'lora_B'):
+            return self.lora_B
+        else:
+            return None
+    
     def get_codebook(self):
         """Get base codebook (without LoRA)"""
         return self.embedding.weight
@@ -53,18 +67,21 @@ class VectorQuantizer(nn.Module):
         """Get effective codebook with LoRA bias (alpha=1.0, regularization controls magnitude)"""
         base_codebook = self.embedding.weight  # [n_e, e_dim]
         
-        if self.use_lora and self.lora_A is not None:
-            # A: [n_e, rank], B: [rank, e_dim]
-            # A @ B: [n_e, e_dim]
-            lora_bias = torch.matmul(self.lora_A, self.lora_B)  # [n_e, e_dim]
-            # alpha = 1.0 (use regularization to control magnitude instead)
-            codebook_with_bias = base_codebook + lora_bias
-            return codebook_with_bias
-        else:
-            return base_codebook
+        if self.use_lora and hasattr(self, 'lora_A') and self.lora_A is not None:
+            # 获取当前的 B 矩阵（支持 Recursive LoRA：动态 B 优先）
+            lora_B = self.get_lora_B()
+            if lora_B is not None:
+                # A: [n_e, rank], B: [rank, e_dim]
+                # A @ B: [n_e, e_dim]
+                lora_bias = torch.matmul(self.lora_A, lora_B)  # [n_e, e_dim]
+                # alpha = 1.0 (use regularization to control magnitude instead)
+                codebook_with_bias = base_codebook + lora_bias
+                return codebook_with_bias
+        
+        return base_codebook
 
     def get_codebook_entry(self, indices, shape=None):
-        if self.use_lora and self.lora_A is not None:
+        if self.use_lora and hasattr(self, 'lora_A') and self.lora_A is not None:
             codebook = self.get_codebook_with_lora()
             z_q = F.embedding(indices, codebook)
         else:
@@ -113,7 +130,7 @@ class VectorQuantizer(nn.Module):
             self.init_emb(latent)
         
         # Get effective codebook (with LoRA if enabled)
-        if self.use_lora and self.lora_A is not None:
+        if self.use_lora and hasattr(self, 'lora_A') and self.lora_A is not None:
             embeddings_weight = self.get_codebook_with_lora()
         else:
             embeddings_weight = self.embedding.weight

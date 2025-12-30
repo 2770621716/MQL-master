@@ -35,9 +35,11 @@ class MMRQVAE(nn.Module):
                  use_lora=False,
                  lora_rank=8,
                  lora_alpha=1.0,
+                 lora_layers=None,
                  align_weight=0.01,
                  lora_reg_weight=1e-4,
-                 lora_ortho_weight=1e-5
+                 lora_ortho_weight=1e-5,
+                 use_recursive_lora=False
         ):
         super(MMRQVAE, self).__init__()
 
@@ -60,6 +62,7 @@ class MMRQVAE(nn.Module):
         self.align_weight = align_weight
         self.lora_reg_weight = lora_reg_weight
         self.lora_ortho_weight = lora_ortho_weight
+        self.use_recursive_lora = use_recursive_lora
 
         # ========== 文本模态 ==========
         self.text_encode_layer_dims = [self.text_dim] + self.layers + [self.e_dim]
@@ -76,7 +79,9 @@ class MMRQVAE(nn.Module):
             use_linear=use_linear,
             use_lora=use_lora,
             lora_rank=lora_rank,
-            lora_alpha=lora_alpha
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            use_recursive_lora=use_recursive_lora
         )
         self.text_decode_layer_dims = self.text_encode_layer_dims[::-1]
         self.text_decoder = MLPLayers(
@@ -99,7 +104,9 @@ class MMRQVAE(nn.Module):
             use_linear=use_linear,
             use_lora=use_lora,
             lora_rank=lora_rank,
-            lora_alpha=lora_alpha
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            use_recursive_lora=use_recursive_lora
         )
         self.image_decode_layer_dims = self.image_encode_layer_dims[::-1]
         self.image_decoder = MLPLayers(
@@ -172,45 +179,134 @@ class MMRQVAE(nn.Module):
         loss_quant = text_rq_loss + image_rq_loss
 
         # 对齐损失（双向 InfoNCE）- 可通过 align_weight=0 关闭
-        """
         if self.align_weight > 0:
             align_loss = self.infonce(z_q_text, z_q_image) + self.infonce(z_q_image, z_q_text)
         else:
             # 返回零 tensor 以保持类型一致性
             align_loss = torch.tensor(0.0, device=text_out.device, dtype=text_out.dtype)
-        """
+
         # LoRA 正则化损失
         lora_reg_loss = 0.0
         lora_ortho_loss = 0.0
         
         if self.use_lora:
             # L2 正则化：约束 A 和 B 的范数
-            # A 是共享的，只需要计算一次
-            if hasattr(self.text_rq, 'shared_lora_A_list'):
-                for A in self.text_rq.shared_lora_A_list:
-                    lora_reg_loss = lora_reg_loss + (A ** 2).sum()
+            # 注意：A 是共享的（通过 share_lora_A_with 实现）
+            # text_rq.shared_lora_A_list[i] 和 image_rq.shared_lora_A_list[i] 指向同一个 Parameter
+            # 因此只需要计算一次，避免重复计算
+            if hasattr(self.text_rq, 'shared_lora_A_list') and hasattr(self.text_rq, 'lora_layers'):
+                for i, A in enumerate(self.text_rq.shared_lora_A_list):
+                    if A is not None and i in self.text_rq.lora_layers:
+                        lora_reg_loss = lora_reg_loss + (A ** 2).sum()
             
-            # B 是各模态独立的
-            for vq_layer in self.text_rq.vq_layers:
-                if hasattr(vq_layer, 'lora_B') and vq_layer.lora_B is not None:
-                    lora_reg_loss = lora_reg_loss + (vq_layer.lora_B ** 2).sum()
+            # B 的正则化
+            # 在 Recursive LoRA 模式下，B 是动态计算的，需要正则化 B_init 和 evolution_network
+            if self.use_recursive_lora:
+                # 正则化 B_init
+                if hasattr(self.text_rq, 'B_init'):
+                    lora_reg_loss = lora_reg_loss + (self.text_rq.B_init ** 2).sum()
+                # 正则化 Evolution Network 的参数
+                if hasattr(self.text_rq, 'evolution_network'):
+                    for param in self.text_rq.evolution_network.parameters():
+                        lora_reg_loss = lora_reg_loss + (param ** 2).sum()
+            else:
+                # 标准 LoRA：B 是各模态独立的，需要分别计算 text 和 image 的 B
+                # 只为使用LoRA的层计算
+                for i, vq_layer in enumerate(self.text_rq.vq_layers):
+                    if i in self.text_rq.lora_layers:
+                        lora_B = vq_layer.get_lora_B()
+                        if lora_B is not None:
+                            lora_reg_loss = lora_reg_loss + (lora_B ** 2).sum()
+                
+                for i, vq_layer in enumerate(self.image_rq.vq_layers):
+                    if i in self.image_rq.lora_layers:
+                        lora_B = vq_layer.get_lora_B()
+                        if lora_B is not None:
+                            lora_reg_loss = lora_reg_loss + (lora_B ** 2).sum()
             
-            for vq_layer in self.image_rq.vq_layers:
-                if hasattr(vq_layer, 'lora_B') and vq_layer.lora_B is not None:
-                    lora_reg_loss = lora_reg_loss + (vq_layer.lora_B ** 2).sum()
+            # 相对约束：约束LoRA bias相对于Base码本的大小
+            # 这样可以防止LoRA过度改变码本，从而保护Base的对齐关系
+            # 与lora_reg_loss不冲突：reg_loss约束绝对大小，这里约束相对大小
+            if hasattr(self.text_rq, 'shared_lora_A_list') and hasattr(self.text_rq, 'lora_layers'):
+                for i, (text_vq, image_vq) in enumerate(zip(self.text_rq.vq_layers, self.image_rq.vq_layers)):
+                    # 只为使用LoRA的层计算
+                    if i in self.text_rq.lora_layers and text_vq.use_lora and hasattr(text_vq, 'lora_A') and text_vq.lora_A is not None:
+                        # 获取当前的 B 矩阵（支持 Recursive LoRA）
+                        text_B = text_vq.get_lora_B()
+                        image_B = image_vq.get_lora_B()
+                        if text_B is not None and image_B is not None:
+                            # 计算LoRA bias
+                            text_lora_bias = torch.matmul(text_vq.lora_A, text_B)  # [n_e, e_dim]
+                            image_lora_bias = torch.matmul(image_vq.lora_A, image_B)  # [n_e, e_dim]
+                        
+                            # Base码本的范数（作为参考）
+                            text_base_norm = text_vq.embedding.weight.norm(p=2, dim=1, keepdim=True)  # [n_e, 1]
+                            image_base_norm = image_vq.embedding.weight.norm(p=2, dim=1, keepdim=True)  # [n_e, 1]
+                            
+                            # LoRA bias的范数
+                            text_bias_norm = text_lora_bias.norm(p=2, dim=1, keepdim=True)  # [n_e, 1]
+                            image_bias_norm = image_lora_bias.norm(p=2, dim=1, keepdim=True)  # [n_e, 1]
+                            
+                            # 相对比例（bias占base的比例）
+                            # 如果这个比例太大，说明LoRA可能过度改变了码本，可能破坏对齐
+                            text_ratio = text_bias_norm / (text_base_norm + 1e-8)  # [n_e, 1]
+                            image_ratio = image_bias_norm / (image_base_norm + 1e-8)  # [n_e, 1]
+                            
+                            # 允许一定比例的变化（比如5-10%），但超过阈值的部分要惩罚
+                            # 这是一个软约束，不会完全禁止LoRA的变化
+                            threshold = 0.1  # 10%的阈值
+                            text_excess = F.relu(text_ratio - threshold).mean()
+                            image_excess = F.relu(image_ratio - threshold).mean()
+                            
+                            # 这个约束与lora_reg_loss不冲突：
+                            # - lora_reg_loss: 约束A和B的绝对大小
+                            # - 这个约束: 约束最终bias相对于Base的相对大小（更直接保护码本）
+                            lora_reg_loss = lora_reg_loss + (text_excess + image_excess)
             
             # 正交约束：让 A 的列向量更独立（防止 rank 塌缩）
-            if hasattr(self.text_rq, 'shared_lora_A_list'):
-                for A in self.text_rq.shared_lora_A_list:
-                    # A: [n_e, rank]
-                    # A^T @ A: [rank, rank]
-                    ATA = torch.matmul(A.t(), A)  # [rank, rank]
-                    I = torch.eye(A.size(1), device=ATA.device, dtype=ATA.dtype)
-                    lora_ortho_loss = lora_ortho_loss + ((ATA - I) ** 2).sum()
+            # 注意：A 是共享的，text_rq 和 image_rq 使用同一个 A
+            # 因此只需要计算一次，避免重复计算
+            # 只为使用LoRA的层计算
+            if hasattr(self.text_rq, 'shared_lora_A_list') and hasattr(self.text_rq, 'lora_layers'):
+                for i, A in enumerate(self.text_rq.shared_lora_A_list):
+                    if A is not None and i in self.text_rq.lora_layers:
+                        # A: [n_e, rank]
+                        # A^T @ A: [rank, rank]
+                        ATA = torch.matmul(A.t(), A)  # [rank, rank]
+                        I = torch.eye(A.size(1), device=ATA.device, dtype=ATA.dtype)
+                        lora_ortho_loss = lora_ortho_loss + ((ATA - I) ** 2).sum()
+            
+            # B 的正交约束：让 B 的行向量更独立（不同 rank 方向应该独立）
+            # B: [rank, e_dim]，约束 B @ B^T = I，即行向量正交
+            # 在 Recursive LoRA 模式下，只约束 B_init
+            if self.use_recursive_lora:
+                if hasattr(self.text_rq, 'B_init'):
+                    B_init = self.text_rq.B_init  # [rank, e_dim]
+                    BBT = torch.matmul(B_init, B_init.t())  # [rank, rank]
+                    I_B = torch.eye(B_init.size(0), device=BBT.device, dtype=BBT.dtype)
+                    lora_ortho_loss = lora_ortho_loss + ((BBT - I_B) ** 2).sum()
+            else:
+                # 标准 LoRA：只为使用LoRA的层计算
+                for i, vq_layer in enumerate(self.text_rq.vq_layers):
+                    if i in self.text_rq.lora_layers:
+                        B = vq_layer.get_lora_B()
+                        if B is not None:
+                            BBT = torch.matmul(B, B.t())  # [rank, rank]
+                            I_B = torch.eye(B.size(0), device=BBT.device, dtype=BBT.dtype)
+                            lora_ortho_loss = lora_ortho_loss + ((BBT - I_B) ** 2).sum()
+                
+                for i, vq_layer in enumerate(self.image_rq.vq_layers):
+                    if i in self.image_rq.lora_layers:
+                        B = vq_layer.get_lora_B()
+                        if B is not None:
+                            BBT = torch.matmul(B, B.t())  # [rank, rank]
+                            I_B = torch.eye(B.size(0), device=BBT.device, dtype=BBT.dtype)
+                            lora_ortho_loss = lora_ortho_loss + ((BBT - I_B) ** 2).sum()
 
         # 总损失
         loss_total = (loss_recon + 
                      self.quant_loss_weight * loss_quant + 
+                     self.align_weight * align_loss +
                      self.lora_reg_weight * lora_reg_loss +
                      self.lora_ortho_weight * lora_ortho_loss)
 
